@@ -10,7 +10,7 @@
 
 #include <pthread.h>
 #include <stdbool.h>
-#include "dst/dio_list.h"
+#include "dio_list.h"
 
 /* defines */
 
@@ -29,17 +29,17 @@ struct cpu_info{
 //shark's personal inventory
 struct shark_inven{
 	pthread_t td;
-	pthread_cond_t cond;
-	struct dl_head* list;
 	struct cpu_info cpuinfo;
 	enum shark_stat stat;
+	int ofd, ifd;
+
+	struct dl_node link;
 };
 
 /* function declares */
 extern void loose_sharks();			//dealing all sharks(all tracing thread)
 extern bool loose_shark(int no);		//create shark (tracing thread)
-extern void shark_signal(pthread_cond_t cond);			//for thread synchronizing
-extern void wait_allsharks_ready();		//will be called from outer thread
 extern void wait_gunfire();			//shark(tracing thread) will be waiting a start sign
+extern void wait_allsharks_done();
 
 #endif 
