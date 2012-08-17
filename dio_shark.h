@@ -23,15 +23,19 @@ enum shark_stat{
 };
 
 /* structures */
-struct cpu_info{
+#define MAX_FILENAME_LEN 256
+struct io_info{
+	int ifd;
+	char ifname[MAX_FILENAME_LEN];
 };
 
 //shark's personal inventory
 struct shark_inven{
 	pthread_t td;
-	struct cpu_info cpuinfo;
 	enum shark_stat stat;
-	int ofd, ifd;
+	bool rnflag;	//running flag. if it is -1, than stop tracing
+	int shkno;	//shark No.
+	struct io_info ioinfo;
 
 	struct dl_node link;
 };
