@@ -36,11 +36,11 @@ struct dl_node{
 // get offset of member in type
 // @param type : 	type contains the member
 // @param member :	member name which you want to know offset
-#define offsetof(type, member) ((int)(&((type*)0)->member))
+#define offsetof(type, member) ((intptr_t)(&((type*)0)->member))
 
 // get dio-list entry
 #define dl_entry(pdln, type, member) ({\
-		const typeof(((type*)0)->member)* __mptr = (pdln);\
+		typeof(((type*)0)->member)* __mptr = (pdln);\
 		(type*)((char*)__mptr - offsetof(type, member));})
 		
 
