@@ -22,29 +22,55 @@
 #include <sys/time.h>
 
 #include "dio_shark.h"
-#include "dst/dio_list.h"
+#include "dio_list.h"
 
-/* define macro and structure define */
+/* ----------------[ define macro and structure define 	]------ */
+#define TRACESETUP _IOWR(0x12, 115)
+#define TRACESTART _IO(0x12, 116)
+#define TRACESTOP _IO(0x12, 117)
+#define TRACEEND _IO(0x12, 118)
 
-/* global variables */
+//the head of all sharks
+struct shark_head{
+	struct dl_node lsp;	//list start point
+	int count;	//created shark count
+	int totshk;	//total shark (include running sharks, sick sharks, done sharks,...)
+
+	pthread_mutex_t sh_mtx;	//mutex for shark head status
+	int rnshk;	//running count
+};
+
+/* -------------------[ global variables ]---------------------	*/
 static int cpucnt = 0;	//number of CPUs
-static struct dl_head* sharks;	//This list's entity data type is struct shark_inven
+static struct shark_head sh;	//shark head
 
-/* function declaration */
+//locks
+// lock and condition variable for gunfire
+static pthread_cond_t gf_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t gf_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+// lock and condition variable for shark synchronous
+static pthread_cond_t s_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t s_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* -------------------[ function declaration ]-----------------	*/
 static void sig_handler(__attribute__((__unused__)) int sig);
 bool parse_args(int argc, char** argv);
 
-void del_sharks(void* pdata);
-
+static void init_shark_head(struct shark_head* psh);
 void* shark_body(void* param);
 
-/* main function */
+/* -------------------[ function implementations ]-------------	*/
 int main(int argc, char** argv){
 	
 	//init settings
 	cpucnt = sysconf(_SC_NPROCESSORS_ONLN);
-	//ioctl setup
+	if( cpucnt <= 0 ){
+		fprintf(stderr, "cannot detect cpus\n");
+		goto cancel;
+	}
 
+/*
 	signal(SIGINT, sig_handler);
 	signal(SIGHUP, sig_handler);
 	signal(SIGTERM, sig_handler);
@@ -54,8 +80,8 @@ int main(int argc, char** argv){
 		fprintf(stderr, "dio-shark argument error.\n");
 		goto cancel;
 	}
+*/
 
-	sharks = create_list_head(del_sharks);
 	loose_sharks();
 
 	//check end states
@@ -72,8 +98,6 @@ void sig_handler(int sig){
 	
 }
 
-void del_sharks(void* pdata){
-}
 /* start parse_args */
 #define ARG_OPTS "d:o:"
 static struct option arg_opts[] = {
@@ -128,11 +152,36 @@ bool parse_args(int argc, char** argv){
 }
 /* end parse_args */
 
+void init_shark_head(struct shark_head* psh){
+	psh->rnshk = 0;
+	psh->count = 0;
+	psh->totshk = 0;
+	
+	INIT_DL_HEAD( &(psh->lsp) );
+	pthread_mutex_init(&(psh->sh_mtx), NULL);
+}
+
 void loose_sharks(){
 	int i;
-	for(i=0; i<cpucnt; i++){
+
+	//init shark head
+	init_shark_head( &sh );
+	sh.totshk = cpucnt;
+
+	for(i=0; i<sh.totshk; i++){
 		loose_shark(i);
 	}
+
+	if( sh.count != sh.totshk ){
+		fprintf(stderr, "some sharks have a problem..\n");
+		exit(-1);
+	}
+
+	//gunfire
+	while(sh.rnshk != sh.totshk)
+		pthread_cond_broadcast(&gf_cond);
+
+	wait_allsharks_done();
 }
 
 bool loose_shark(int no){
@@ -140,18 +189,23 @@ bool loose_shark(int no){
 	int i=0;
 
 	si = (struct shark_inven*)malloc(sizeof(struct shark_inven));
+
 	if( pthread_create(&(si->td), NULL, shark_body, si) ){	
 		fprintf(stderr, "shark can not create his body.\n");
 		return false;
 	}
 
-	//pthread_cond_wait(si->cond, 0);
+	dl_push_back(sh.lsp, si->link);
+	sh.count++;
+
+	pthread_mutex_lock(&s_mtx);
+	pthread_cond_wait(&s_cond, &s_mtx);
+	pthread_mutex_unlock(&s_mtx);
+
 	if( si->stat != SHARK_READY ){
 		//oh dear..
 	}
 
-	
-	//add si to 'sharks' the global shark handler
 	return true;
 }
 
@@ -159,20 +213,40 @@ void* shark_body(void* param){
 	struct shark_inven* inven = (struct shark_inven*)param;
 
 	//get cpu info
-	//set pollfd
 	//set outfd
-	//set poll event
 	inven->stat = SHARK_READY;
-	//shark_signal(inven->cond);
+	pthread_cond_signal(&s_cond);
 
-	//wait gunfire
+	wait_gunfire();
+	inven->stat = SHARK_WORKING;
+	pthread_mutex_lock(&(sh.sh_mtx));
+	sh.rnshk++;
+	pthread_mutex_unlock(&(sh.sh_mtx));
+
+	printf("go\n");
+
 	//ioctl start
+/*
 	while(1){
-
 	}
+*/
 	//ioctl stop
 	//signal done
 
 	return NULL;
 }
 
+void wait_gunfire(){
+	pthread_mutex_lock(&gf_mtx);
+	pthread_cond_wait(&gf_cond, &gf_mtx);
+	pthread_mutex_unlock(&gf_mtx);
+}
+
+void wait_allsharks_done(){
+	struct dl_node* con = NULL;
+	__foreach_list(con, &sh.lsp){
+		struct shark_inven* entry = dl_entry(con, struct shark_inven, link);
+		pthread_join(entry->td, NULL);
+	}
+	printf("all sharks work doen\n");
+}
