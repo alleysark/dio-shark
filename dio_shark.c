@@ -53,13 +53,13 @@ struct dio_trace_res{
 #define TRACESETUP _IOWR(0x12, 115, struct dio_trace_setup)
 #define TRACESTART _IO(0x12, 116)
 #define TRACESTOP _IO(0x12, 117)
-#define TRACEEND _IO(0x12, 118)
+#define TRACETEARDOWN _IO(0x12, 118)
 
 #define DBG_PATH "/sys/kernel/debug"
 
 //the head of all sharks
 struct shark_head{
-	struct dl_node lsp;	//list start point
+	struct dl_node lsp;	//list start point. shark list's entry is struct shark_inven
 	int count;	//created shark count
 	int totshk;	//total shark (include running sharks, sick sharks, done sharks,...)
 
@@ -67,11 +67,32 @@ struct shark_head{
 	int rnshk;	//running count
 };
 
+#define MAX_FILENAME_LEN 128
+enum dev_stat { 
+	OPEN=0,
+	SETUP,
+	START,
+	STOP,
+	TEARDOWN
+};
+
+struct dev_entity{
+	struct dl_node link;
+	char devname[MAX_FILENAME_LEN];
+	int dfd;	//device file descriptor
+	enum dev_stat stat;
+};
+
+#define DEFAULT_TIMEOUT 10000	//10sec
+struct dlst_head{
+	struct dl_node lsp;	//dev list start point
+	int count;
+	uint32_t timeout;	//polling timeout value
+};
 /* -------------------[ global variables ]---------------------	*/
 static int cpucnt = 0;	//number of CPUs
-static int dfd;	//dev file descriptor
-static char devpathname[MAX_FILENAME_LEN];
 static struct shark_head sh;	//shark head
+static struct dlst_head dlsth;	//dev list head
 
 #define ARG_OPTS "d:o:"
 static struct option arg_opts[] = {
@@ -111,12 +132,19 @@ static pthread_mutex_t s_mtx = PTHREAD_MUTEX_INITIALIZER;
 static void sig_handler(__attribute__((__unused__)) int sig);
 bool parse_args(int argc, char** argv);
 
-static void init_shark_head(struct shark_head* psh);
+static void init_shark_head();
 
-static void setup_dts();	//setup dio trace setup
-static void start_dts();	//start dio trace setup
+static void init_dlst_head();
+static bool add_dev(char* devpath);
+static void clear_dev();
+
+static bool open_fds(struct shark_inven* pshk);
+static void clear_fds(struct shark_inven* pshk);
+
+static bool setup_dts();	//setup dio trace setup
+static bool start_dts();	//start dio trace setup
 static void stop_dts();
-static void end_dts();
+static void teardown_dts();
 
 void* shark_body(void* param);
 
@@ -125,10 +153,16 @@ int main(int argc, char** argv){
 	//init settings
 	cpucnt = sysconf(_SC_NPROCESSORS_ONLN);
 	if( cpucnt <= 0 ){
-		fprintf(stderr, "cannot detect cpus\n");
+		perror("cannot detect cpus.");
 		goto cancel;
 	}
 
+	init_shark_head();
+	sh.totshk = cpucnt;
+
+	init_dlst_head();
+	
+	
 	signal(SIGINT, sig_handler);
 	signal(SIGHUP, sig_handler);
 	signal(SIGTERM, sig_handler);
@@ -139,9 +173,8 @@ int main(int argc, char** argv){
 		goto cancel;
 	}
 */
-	dfd = open("/dev/sda", O_RDONLY);
-	if( dfd < 0 ){
-		perror("Failed to open dev");
+	//open device path
+	if( !add_dev("/dev/sda") ){
 		goto cancel;
 	}
 
@@ -195,62 +228,183 @@ bool parse_args(int argc, char** argv){
 }
 /* end parse_args */
 
-void init_shark_head(struct shark_head* psh){
-	psh->rnshk = 0;
-	psh->count = 0;
-	psh->totshk = 0;
+void init_shark_head(){
+	sh.rnshk = 0;
+	sh.count = 0;
+	sh.totshk = 0;
 	
-	INIT_DL_HEAD( &(psh->lsp) );
-	pthread_mutex_init(&(psh->sh_mtx), NULL);
+	INIT_DL_HEAD( &(sh.lsp) );
+	pthread_mutex_init(&(sh.sh_mtx), NULL);
 }
 
-void setup_dts(){
+void init_dlst_head(){
+	dlsth.count = 0;
+	dlsth.timeout = DEFAULT_TIMEOUT;
+
+	INIT_DL_HEAD( &(dlsth.lsp));
+}
+
+bool add_dev(char* devpath){
+	struct dev_entity* dv = (struct dev_entity*)malloc(sizeof(struct dev_entity));
+	memset(dv, 0, sizeof(struct dev_entity));
+	
+	strncpy(dv->devname, devpath, MAX_FILENAME_LEN);
+	
+	dv->dfd = open(dv->devname, O_RDONLY | O_NONBLOCK);
+	if( dv->dfd < 0 ){
+		perror("Failed to open dev path");
+		free(dv);
+		return false;
+	}
+	dv->stat = OPEN;
+
+	dl_push_back(dlsth.lsp, dv->link);
+	printf(" > dev %s is added\n", dv->devname);
+	return true;
+}
+
+void clear_dev(){
+	struct dl_node* p = NULL;
+
+	__foreach_list(p, &dlsth.lsp){
+		struct dev_entity* pdv = dl_entry(p, struct dev_entity, link);
+		close(pdv->dfd);
+	}
+}
+
+bool open_fds(struct shark_inven* pshk){
+	struct dl_node* p = NULL;
+	char fnbuf[MAX_FILENAME_LEN];
+
+	pshk->pfds = (struct pollfd*)malloc(sizeof(struct pollfd)*dlsth.count);
+	memset(pshk->pfds, 0, sizeof(struct pollfd)*dlsth.count);
+
+	int idx = 0;
+	__foreach_list(p, &dlsth.lsp){
+		struct dev_entity* pdv = dl_entry(p, struct dev_entity, link);
+
+		memset(fnbuf, 0, MAX_FILENAME_LEN);
+		snprintf(fnbuf, MAX_FILENAME_LEN, "%s/block/%s/trace%d",
+			DBG_PATH, pdv->devname, pshk->shkno);
+
+		pshk->pfds[idx].events = POLLIN;
+		pshk->pfds[idx].fd = open(fnbuf, O_RDONLY | O_NONBLOCK);
+		if( pshk->pfds[idx].fd < 0 ){
+			perror("Failed to open fd");
+			free(pshk->pfds);
+			return false;
+		}
+		idx++;
+	}
+	return true;
+}
+
+void clear_fds(struct shark_inven* pshk){
+	int i;
+	for(i=0; i<dlsth.count; i++){
+		pshk->pfds[i].events = 0;
+		pshk->pfds[i].revents = 0;
+		close(pshk->pfds[i].fd);
+	}
+	free(pshk->pfds);
+}
+
+bool setup_dts(){
 	struct dio_trace_setup dts;
+
 	memset( &dts, 0, sizeof(struct dio_trace_setup));
 	dts.buf_size = 512*1024;
 	dts.buf_nr = 4;
 	dts.act_mask = (uint16_t)(~0U);
 
-	if( ioctl(dfd, TRACESETUP, &dts) < 0 ){
-		perror("Failed to setup dio_trace_setup");
-		exit(-1);
-	}else{
-		strncpy(devpathname,dts.name, MAX_FILENAME_LEN);
-		printf("%s\n", devpathname);
+	struct dl_node* p = NULL;
+	__foreach_list(p, &dlsth.lsp){
+		struct dev_entity* pdv = dl_entry(p, struct dev_entity, link);
+		printf(" > i'll set up the %s dev i/o control\n", pdv->devname);
+
+		if( pdv->stat == OPEN ){
+			if( ioctl(pdv->dfd, TRACESETUP, &dts) < 0 ){
+				perror("Failed to setup dio_trace_setup");
+				return false;
+			}else{
+				strncpy(pdv->devname,dts.name, MAX_FILENAME_LEN);
+				pdv->stat = SETUP;
+				printf(" > setup dts for %s\n", pdv->devname);
+			}
+		}
 	}
+	return true;
 }
 
-void start_dts(){
-	if( ioctl(dfd, TRACESTART) < 0 ){
-		perror("Failed to start dio_trace_setup");
+bool start_dts(){
+	struct dl_node* p = NULL;
+	__foreach_list(p, &dlsth.lsp){
+		struct dev_entity* pdv = dl_entry(p, struct dev_entity, link);
+	
+		if( pdv->stat == SETUP ){
+			if( ioctl(pdv->dfd, TRACESTART) < 0 ){
+				perror("Failed to start dio_trace_setup");
+				return false;
+			}
+			else{
+				pdv->stat = START;
+			}
+		}
 	}
-	printf("start dio trace setup\n");
+	printf("all traces are started\n");
+	return true;
 }
 
 void stop_dts(){
-	if( ioctl(dfd, TRACESTOP) < 0 ){
-		perror("Failed to stop dio_trace_setup");
+	struct dl_node* p = NULL;
+	__foreach_list(p, &dlsth.lsp){
+		struct dev_entity* pdv = dl_entry(p, struct dev_entity, link);
+
+		if( pdv->stat == START ){
+			if( ioctl(pdv->dfd, TRACESTOP) < 0 ){
+				perror("Failed to stop dio_trace_setup");
+			}
+			else{
+				pdv->stat = STOP;
+			}
+		}
 	}
-	printf("stop dio trace setup\n");
+	printf("all traces are stoped\n");
 }
 
-void end_dts(){
-	if( ioctl(dfd, TRACEEND) < 0 ){
-		perror("Failed to teardown dio_trace_setup");
+void teardown_dts(){
+	struct dl_node* p = NULL;
+	__foreach_list(p, &dlsth.lsp){
+		struct dev_entity* pdv = dl_entry(p, struct dev_entity, link);
+
+		if( pdv->stat == STOP ){
+			if( ioctl(pdv->dfd, TRACETEARDOWN) < 0 ){
+				perror("Failed to teardown dio_trace_setup");
+			}
+			else{
+				pdv->stat = TEARDOWN;
+			}
+		}
 	}
-	printf("end dio trace setup\n");
+	printf("all traces are teardown\n");
 }
+
+void add_shark(struct shark_inven* pshk){
+	pthread_mutex_lock(&sh.sh_mtx);
+	dl_push_back(sh.lsp, pshk->link);
+	sh.count++;
+	pthread_mutex_unlock(&sh.sh_mtx);
+}
+
 void loose_sharks(){
 	int i;
 
-	setup_dts();
-
-	//init shark head
-	init_shark_head( &sh );
-	sh.totshk = cpucnt;
+	if( !setup_dts() )
+		goto err;
 
 	for(i=0; i<sh.totshk; i++){
-		loose_shark(i);
+		if( !loose_shark(i) )
+			break;
 	}
 
 	if( sh.count != sh.totshk ){
@@ -258,16 +412,16 @@ void loose_sharks(){
 		goto err;
 	}
 
-	start_dts();
+	if( !start_dts() ){
+		call_sharks_off();
+	}
 
-	//gunfire
-	while(sh.rnshk != sh.totshk)
-		pthread_cond_broadcast(&gf_cond);
-
+	gun_fire();
+	
 	wait_allsharks_done();
 err:
 	stop_dts();
-	end_dts();
+	teardown_dts();
 }
 
 bool loose_shark(int no){
@@ -275,7 +429,9 @@ bool loose_shark(int no){
 	int i=0;
 
 	si = (struct shark_inven*)malloc(sizeof(struct shark_inven));
+
 	//init shark inventory
+	memset(si, 0, sizeof(struct shark_inven));
 	si->shkno = no;
 	si->rnflag = true;
 
@@ -284,9 +440,10 @@ bool loose_shark(int no){
 		return false;
 	}
 
-	dl_push_back(sh.lsp, si->link);
-	sh.count++;
-
+	//add shark to shark head
+	add_shark(si);
+	
+	//wait shark's signal
 	pthread_mutex_lock(&s_mtx);
 	pthread_cond_wait(&s_cond, &s_mtx);
 	pthread_mutex_unlock(&s_mtx);
@@ -301,23 +458,26 @@ bool loose_shark(int no){
 
 void* shark_body(void* param){
 	struct shark_inven* inven = (struct shark_inven*)param;
+	bool err = false;
 
 	//set dev-cpu input file descriptor
-	snprintf(inven->ioinfo.ifname, MAX_FILENAME_LEN, "%s/block/%s/trace%d",
-		DBG_PATH, devpathname, inven->shkno);
-	inven->ioinfo.ifd = open(inven->ioinfo.ifname, O_RDONLY);
-	if( inven->ioinfo.ifd < 0){
-		perror("Failed to open ifd");
+	if( !open_fds(inven) ){
 		inven->stat = SHARK_SICK;
 		pthread_cond_signal(&s_cond);
-		goto end;
+		return NULL;
 	}
+
 	//set shark's status to ready
 	inven->stat = SHARK_READY;
 	pthread_cond_signal(&s_cond);
 
 	wait_gunfire();
 	
+	if( inven->rnflag == false ){
+		err = false;
+		goto end;
+	}
+
 	//set shark's status to working 
 	inven->stat = SHARK_WORKING;
 	pthread_mutex_lock(&(sh.sh_mtx));
@@ -326,31 +486,68 @@ void* shark_body(void* param){
 
 	printf("go\n");
 
-	int dtrsz = sizeof(struct dio_trace_res);
-	int rdsz = 0;
+	int polret = 0;
+	int dtr_sz = sizeof(struct dio_trace_res);
+	int read_sz = 0;
 	int zerocnt = 0;
 	struct dio_trace_res dtrbuf;
 	while( inven->rnflag){
-		memset(&dtrbuf, 0, dtrsz);
+		memset(&dtrbuf, 0, dtr_sz);
 		
-		rdsz = read(inven->ioinfo.ifd, &dtrbuf, dtrsz);
-		if( rdsz == 0){
+		polret = poll(inven->pfds,dlsth.count, dlsth.timeout);
+		if( polret == 0 ){ //timeout
 			zerocnt++;
-			if( zerocnt >= 100000000 )
-				break;
+			if( zerocnt > 1000000 ){
+				err = false;
+				goto end;
+			}
 		}
-		else if( rdsz < 0){
+		else if(polret < 0){ //error
+			perror("Failed to poll");
+			err = true;
+			goto end;
+		}
+		
+
+		read_sz = read(polret, &dtrbuf, dtr_sz);
+		if( read_sz == 0){
+			zerocnt++;
+			if( zerocnt >= 100000000 ){
+				err = false;
+				goto end;
+			}
+		}
+		else if( read_sz < 0){
 			perror("Failed to read");
-			break;
+			err = true;
+			goto end;
 		}
-		printf("read size : %d, seq : %d, time %ld, action %d\n",rdsz, dtrbuf.sequence, dtrbuf.time, dtrbuf.action);
+		printf("read size : %d, seq : %d, time %ld, action %d\n",read_sz, dtrbuf.sequence, dtrbuf.time, dtrbuf.action);
 	}
 	
 	//signal done
-	inven->stat = SHARK_DONE;
-	close(inven->ioinfo.ifd);
 end:
+	inven->rnflag = false;
+	clear_fds(inven);
+
+	if( !err )
+		inven->stat = SHARK_DONE;
+	else
+		inven->stat = SHARK_SICK;
+
 	return NULL;
+}
+
+void call_sharks_off(){
+	struct dl_node* p = NULL;
+	__foreach_list(p, &sh.lsp){
+		struct shark_inven* pshk = dl_entry(p, struct shark_inven, link);
+		pshk->rnflag = false;
+	}
+}
+void gun_fire(){
+	while(sh.rnshk != sh.totshk)
+		pthread_cond_broadcast(&gf_cond);
 }
 
 void wait_gunfire(){
