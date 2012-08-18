@@ -8,6 +8,7 @@
 	in dio-shark, shark means tracing thread
 */
 
+#include <sys/poll.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include "dio_list.h"
@@ -23,11 +24,6 @@ enum shark_stat{
 };
 
 /* structures */
-#define MAX_FILENAME_LEN 256
-struct io_info{
-	int ifd;
-	char ifname[MAX_FILENAME_LEN];
-};
 
 //shark's personal inventory
 struct shark_inven{
@@ -35,14 +31,19 @@ struct shark_inven{
 	enum shark_stat stat;
 	bool rnflag;	//running flag. if it is -1, than stop tracing
 	int shkno;	//shark No.
-	struct io_info ioinfo;
+
+	struct pollfd* pfds;	//polling file descriptor of each dev-trace'shkno'
 
 	struct dl_node link;
 };
 
 /* function declares */
+extern void add_shark(struct shark_inven* pshk);
 extern void loose_sharks();			//dealing all sharks(all tracing thread)
 extern bool loose_shark(int no);		//create shark (tracing thread)
+extern void call_sharks_off();			//call all the sharks off
+
+extern void gun_fire();
 extern void wait_gunfire();			//shark(tracing thread) will be waiting a start sign
 extern void wait_allsharks_done();
 
