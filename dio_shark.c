@@ -91,6 +91,7 @@ struct dlst_head{
 	int count;
 	uint32_t timeout;	//polling timeout value
 };
+
 /* -------------------[ global variables ]---------------------	*/
 static int cpucnt = 0;	//number of CPUs
 static struct shark_head sh;	//shark head
@@ -135,6 +136,7 @@ static void sig_handler(__attribute__((__unused__)) int sig);
 bool parse_args(int argc, char** argv);
 
 static void init_shark_head();
+static void destroy_shark_head();
 
 static void init_dlst_head();
 static bool add_dev(char* devpath);	//add and open
@@ -162,10 +164,9 @@ int main(int argc, char** argv){
 	}
 
 	init_shark_head();
-	sh.totshk = cpucnt;
+	sh.totshk = cpucnt;	
 
 	init_dlst_head();
-	
 	
 	signal(SIGINT, sig_handler);
 	signal(SIGHUP, sig_handler);
@@ -244,6 +245,11 @@ void init_shark_head(){
 	pthread_mutex_init(&(sh.sh_mtx), NULL);
 }
 
+void destroy_shark_head(){
+	//DESTROY_DL_HEAD( &(sh.lsp) );
+	pthread_mutex_destroy( &(sh.sh_mtx) );
+}
+
 void init_dlst_head(){
 	dlsth.count = 0;
 	dlsth.timeout = DEFAULT_TIMEOUT;
@@ -255,9 +261,7 @@ bool add_dev(char* devpath){
 	struct dev_entity* dv = (struct dev_entity*)malloc(sizeof(struct dev_entity));
 	memset(dv, 0, sizeof(struct dev_entity));
 	
-	strncpy(dv->devname, devpath, MAX_FILENAME_LEN);
-	
-	dv->dfd = open(dv->devname, O_RDONLY | O_NONBLOCK);
+	dv->dfd = open(devpath, O_RDONLY | O_NONBLOCK);
 	if( dv->dfd < 0 ){
 		perror("Failed to open dev path");
 		free(dv);
@@ -267,7 +271,8 @@ bool add_dev(char* devpath){
 
 	dl_push_back(dlsth.lsp, dv->link);
 	dlsth.count++;
-	printf(" > dev %s is added\n", dv->devname);
+	printf(" > dev %s is added\n", devpath);
+
 	return true;
 }
 
@@ -339,7 +344,7 @@ bool open_fds(struct shark_inven* pshk){
 		memset(fnbuf, 0, MAX_FILENAME_LEN);
 		snprintf(fnbuf, MAX_FILENAME_LEN, "%s/block/%s/trace%d",
 			DBG_PATH, pdv->devname, pshk->shkno);
-		printf(" >> open fds path for cpu \'%d\' : %s\n",pshk->shkno, fnbuf);
+		printf(" > open fds path for cpu \'%d\' : %s\n",pshk->shkno, fnbuf);
 
 		pshk->pfds[idx].events = POLLIN;
 		pshk->pfds[idx].revents = 0;
@@ -380,7 +385,7 @@ bool setup_dts(){
 				perror("Failed to setup dio_trace_setup");
 				return false;
 			}else{
-				strncpy(pdv->devname,dts.name, MAX_FILENAME_LEN);
+				strncpy(pdv->devname, dts.name, strlen(dts.name));
 				pdv->stat = SETUP;
 				printf(" > setup dts for %s\n", pdv->devname);
 			}
@@ -545,9 +550,13 @@ void* shark_body(void* param){
 
 	while( inven->rnflag){
 		memset(&dtrbuf, 0, dtr_sz);
-		
 		retevs = poll(inven->pfds,dlsth.count, dlsth.timeout);
 		if( retevs == 0 ){ //timeout
+			if( !inven->rnflag ){
+				err = false;
+				goto end;
+			}
+				
 			printf(" > poll timeout\n");
 			continue;
 		}
