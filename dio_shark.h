@@ -32,7 +32,7 @@ struct shark_inven{
 	bool rnflag;	//running flag. if it is -1, than stop tracing
 	int shkno;	//shark No.
 
-	struct pollfd* pfds;	//polling file descriptor of each dev-trace'shkno'
+	struct pollfd *pfds;	//polling file descriptor of each dev-trace'shkno'
 
 	struct dl_node link;
 };
