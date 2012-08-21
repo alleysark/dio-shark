@@ -70,7 +70,7 @@ struct shark_head{
 
 #define MAX_FILENAME_LEN 128
 enum dev_stat { 
-	OPEN=0,
+	OPEN=100,
 	SETUP,
 	START,
 	STOP,
@@ -85,7 +85,7 @@ struct dev_entity{
 	enum dev_stat stat;
 };
 
-#define DEFAULT_TIMEOUT 1000	//10sec
+#define DEFAULT_TIMEOUT 50	//10sec
 struct dlst_head{
 	struct dl_node lsp;	//dev list start point
 	int count;
@@ -94,6 +94,7 @@ struct dlst_head{
 
 /* -------------------[ global variables ]---------------------	*/
 static int cpucnt = 0;	//number of CPUs
+static bool issig = false;	//is signal occured
 static struct shark_head sh;	//shark head
 static struct dlst_head dlsth;	//dev list head
 
@@ -167,7 +168,7 @@ int main(int argc, char** argv){
 	sh.totshk = cpucnt;	
 
 	init_dlst_head();
-	
+
 	signal(SIGINT, sig_handler);
 	signal(SIGHUP, sig_handler);
 	signal(SIGTERM, sig_handler);
@@ -203,6 +204,7 @@ void sig_handler(int sig){
 		struct shark_inven* pinv = dl_entry(p, struct shark_inven, link);
 		pinv->rnflag = false;
 	}
+	issig = true;
 }
 
 /* start parse_args */
@@ -261,7 +263,7 @@ bool add_dev(char* devpath){
 	struct dev_entity* dv = (struct dev_entity*)malloc(sizeof(struct dev_entity));
 	memset(dv, 0, sizeof(struct dev_entity));
 	
-	dv->dfd = open(devpath, O_RDONLY | O_NONBLOCK);
+	dv->dfd = open(devpath, O_RDONLY);
 	if( dv->dfd < 0 ){
 		perror("Failed to open dev path");
 		free(dv);
@@ -340,19 +342,21 @@ bool open_fds(struct shark_inven* pshk){
 	int idx = 0;
 	__foreach_list(p, &dlsth.lsp){
 		struct dev_entity* pdv = dl_entry(p, struct dev_entity, link);
-
-		memset(fnbuf, 0, MAX_FILENAME_LEN);
-		snprintf(fnbuf, MAX_FILENAME_LEN, "%s/block/%s/trace%d",
-			DBG_PATH, pdv->devname, pshk->shkno);
-		printf(" > open fds path for cpu \'%d\' : %s\n",pshk->shkno, fnbuf);
-
-		pshk->pfds[idx].events = POLLIN;
-		pshk->pfds[idx].revents = 0;
-		pshk->pfds[idx].fd = open(fnbuf, O_RDONLY | O_NONBLOCK);
-		if( pshk->pfds[idx].fd < 0 ){
-			perror("Failed to open fds");
-			free(pshk->pfds);
-			return false;
+	
+		if(pdv->stat == SETUP){
+			memset(fnbuf, 0, MAX_FILENAME_LEN);
+			snprintf(fnbuf, MAX_FILENAME_LEN, "%s/block/%s/trace%d",
+				DBG_PATH, pdv->devname, pshk->shkno);
+			printf(" > open fds path for cpu \'%d\' : %s\n",pshk->shkno, fnbuf);
+	
+			pshk->pfds[idx].events = POLLIN;
+			pshk->pfds[idx].revents = 0;
+			pshk->pfds[idx].fd = open(fnbuf, O_RDONLY);
+			if( pshk->pfds[idx].fd < 0 ){
+				perror("Failed to open fds");
+				free(pshk->pfds);
+				return false;
+			}
 		}
 		idx++;
 	}
@@ -385,7 +389,7 @@ bool setup_dts(){
 				perror("Failed to setup dio_trace_setup");
 				return false;
 			}else{
-				strncpy(pdv->devname, dts.name, strlen(dts.name));
+				strncpy(pdv->devname, dts.name, MAX_FILENAME_LEN);
 				pdv->stat = SETUP;
 				printf(" > setup dts for %s\n", pdv->devname);
 			}
@@ -515,13 +519,17 @@ void* shark_body(void* param){
 	struct shark_inven* inven = (struct shark_inven*)param;
 	bool err = false;
 
+#if 0
 	//set dev-cpu input file descriptor
 	if( !open_fds(inven) ){
 		inven->stat = SHARK_SICK;
+		pthread_mutex_lock(&s_mtx);
 		pthread_cond_signal(&s_cond);
+		pthread_mutex_unlock(&s_mtx);
 		return NULL;
 	}
 
+#endif
 	//set shark's status to ready
 	inven->stat = SHARK_READY;
 	pthread_cond_signal(&s_cond);
@@ -548,16 +556,27 @@ void* shark_body(void* param){
 	int i=0;
 	struct dio_trace_res dtrbuf;
 
+
+struct pollfd pfd;
+pfd.fd = open("/sys/kernel/debug/block/sda/trace0", O_RDONLY);
+if( pfd.fd < 0)
+{	err = true;
+	goto end;
+}
+pfd.events = POLLIN;
+pfd.revents = 0;
+
 	while( inven->rnflag){
 		memset(&dtrbuf, 0, dtr_sz);
-		retevs = poll(inven->pfds,dlsth.count, dlsth.timeout);
+		//retevs = poll((struct pollfd*)(inven->pfds),dlsth.count, dlsth.timeout);
+retevs = poll(&pfd, 1, 100);
 		if( retevs == 0 ){ //timeout
 			if( !inven->rnflag ){
 				err = false;
 				goto end;
 			}
 				
-			printf(" > poll timeout\n");
+			//printf(" > poll timeout\n");
 			continue;
 		}
 		else if(retevs < 0){ //error
@@ -565,8 +584,18 @@ void* shark_body(void* param){
 			err = true;
 			goto end;
 		}
+if(pfd.revents & POLLIN){
+read_sz = read(pfd.fd, &dtrbuf, dtr_sz);
+if( read_sz < 0){
+	perror("read err");
+err = true;
+goto end;
+}
+printf("read size : %d, seq : %d, time %ld, action %d\n",
+read_sz, dtrbuf.sequence, dtrbuf.time, dtrbuf.action);
+}
 		
-
+#if 0
 		for(i=0; i<dlsth.count; i++){
 			if( inven->pfds[i].revents & POLLIN ){
 				
@@ -588,6 +617,7 @@ void* shark_body(void* param){
 					read_sz, dtrbuf.sequence, dtrbuf.time, dtrbuf.action);
 			}
 		}
+#endif
 	}
 	
 	//signal done
@@ -611,7 +641,7 @@ void call_sharks_off(){
 	}
 }
 void gun_fire(){
-	while(sh.rnshk != sh.totshk)
+	while(sh.rnshk != sh.count && !issig)
 		pthread_cond_broadcast(&gf_cond);
 }
 
