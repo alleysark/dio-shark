@@ -66,7 +66,7 @@ struct dl_node{
 // @param dlh :		the dio list head which is the type of dl_node
 // @param dln :		the dl_node value you want to push
 #define dl_push_back(dlh, dln) \
-		__insert_node( &dln, dlh.prv, &dlh);
+		__insert_node( &(dln), (dlh.prv), &(dlh));
 
 
 /*
